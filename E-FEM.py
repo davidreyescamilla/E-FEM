@@ -599,8 +599,10 @@ def G_s(element, n):
     x0 = (x1 + x2 + x3) / 3
     y0 = (y1 + y2 + y3) / 3
 
-    b1, b2, b3 = (y2 - y3) * heaviside(x1, y1, x0, y0, n), (y3 - y1) * heaviside(x2, y2, x0, y0, n), (y1 - y2) * heaviside(x3, y3, x0, y0, n)
-    c1, c2, c3 = (x3 - x2) * heaviside(x1, y1, x0, y0, n), (x1 - x3) * heaviside(x2, y2, x0, y0, n), (x2 - x1) * heaviside(x3, y3, x0, y0, n)
+    H1, H2, H3 = heaviside(x1, y1, x0, y0, n), heaviside(x2, y2, x0, y0, n), heaviside(x3, y3, x0, y0, n)
+
+    b1, b2, b3 = (y2 - y3) * H1, (y3 - y1) * H2, (y1 - y2) * H3
+    c1, c2, c3 = (x3 - x2) * H1, (x1 - x3) * H2, (x2 - x1) * H3
     # In the E-FEM formulation, we find a sum for all elements in \Omega^+, however for the SKON formulation G = dH, so by the moment G will be defined at an elementary level and then assembled in a global matrix
     dphi_dx = (b1 + b2 + b3) / (2 * area(element))
     dphi_dy = (c1 + c2 + c3) / (2 * area(element))
@@ -611,6 +613,13 @@ def G_s(element, n):
     G_s[2, 0::2] = dphi_dy
     G_s[2, 1::2] = dphi_dx
     return G_s
+
+# Within the EAS method, we have to compute the real strain field accounting for the strong discontinuity: \varepsilon = \nabla^{sym} d + G_s * [|u|] (check if it was + or -)
+def compute_enhanced_epsilon(element, d, u_modulus, n_vector):
+    epsilon = np.zeros([len(elements), 3])
+    u_e = np.array([u[2 * node + j] for node in element for j in range(2)])
+    epsilon = B(element) @ u_e + G_s(element, n_vectors) * u_modulus @ n_vector
+    return epsilon
 
 # We need an easy way to reshape the stress tensor, in Voigt notation, to its matricial form
 def eigen_sigma(E, nu, epsilon):
@@ -630,10 +639,8 @@ def eigen_sigma(E, nu, epsilon):
     """Note: we will be taking the first two coordinates of the eigenvector. As we are dealing with a plane problem we will assume the eigenvalues found for the max stress will be in-plane."""
     return eigenvalues[max_index], eigenvectors[:2, max_index]
 
-def compute_epsilon_e(element, d):
-    """Compute the strain tensor"""
-    B_mat = B(element)
-    return B_mat @ d
+def compute_q(sigma_y, G_f, u_modulus):
+    return (sigma_y / G_f) * np.exp(- (sigma_y / G_f) * u_modulus)
 
 # And modify some of the functions accordingly:
 def initial_iteration(K, F, sigma_y, elements, nodes):
@@ -655,20 +662,19 @@ def initial_iteration(K, F, sigma_y, elements, nodes):
         return d, None, None, None
 
 # Now, the IMPL-EX solver will also use and update the crack orientation for the different elements
-def IMPL_EX_solver(displacement_states, stiffness_states, n_vectors_init, delta_f_next_init, delta_f_init, F_incremental, tolerance, max_iter):
+def IMPL_EX_solver(displacement_states, stiffness_states, modulus_u_init, n_vectors_init, delta_f_next_init, delta_f_init, F_incremental, tolerance, max_iter):
     """Perform the non-linear analysis using the IMPL-EX solver"""
     local_iter = 0
-    d, delta_d, K, delta_f_next, delta_f, n_vectors = displacement_states[-1], displacement_states[-1] - displacement_states[-2], stiffness_states[-1], delta_f_next_init, delta_f_init, n_vectors_init
+    d, delta_d, K, delta_f_next, delta_f, n_vectors, modulus_u = displacement_states[-1], displacement_states[-1] - displacement_states[-2], stiffness_states[-1], delta_f_next_init, delta_f_init, n_vectors_init, modulus_u_init
 
     R = F_incremental - K @ d
 
     while np.linalg.norm(R) > tolerance:
         tilde_d = d + (delta_f_next / delta_f) * delta_d
-        sigma = compute_stress(elements, tilde_d)
         for e, element in enumerate(elements):
             global_dofs = np.array([2 * node + i for node in element for i in range(2)])
-            eigenvalue, eigenvector = eigen_sigma(E, nu, compute_epsilon_e(element, tilde_d[global_dofs]))
-            if eigenvalue >= sigma_y:
+            eigenvalue, eigenvector = eigen_sigma(E, nu, compute_enhanced_epsilon(element, tilde_d, modulus_u[e], n_vectors[e])) # This way we compute real stress in the element 
+            if eigenvalue >= sigma_y - compute_q(sigma_y, G_f, modulus_u[e]): # And compare it using the traction-separation law
                 n_vectors.setdefault(e, eigenvector)  # Add eigenvector if not already present
             if e in n_vectors:  # Perform stiffness modification only if a crack is present
                 K, K_sc_mat = modify_K(K, sigma_y, G_f, element, n_vectors[e], tilde_d[global_dofs], global_dofs)
